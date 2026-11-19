@@ -1,5 +1,5 @@
-
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import Depends, FastAPI
 from sqlalchemy import text
@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from memory_vault.api.routes.users import router as users_router
 from memory_vault.config import get_settings
 from memory_vault.database import create_database_url, get_session
 
@@ -40,6 +41,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(users_router)
+
 
 @app.get("/health")
 async def health():
@@ -48,7 +51,7 @@ async def health():
 
 @app.get("/health/db")
 async def database_health(
-    session: AsyncSession = Depends(get_session),
+    session: Annotated[AsyncSession, Depends(get_session)],
 ):
     result = await session.execute(text("SELECT 1"))
 

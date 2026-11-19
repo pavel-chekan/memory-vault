@@ -1,14 +1,12 @@
-
 import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool, URL
+from sqlalchemy import URL, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from memory_vault.config import get_settings
 from memory_vault.models import Base
-
 
 config = context.config
 
@@ -29,6 +27,7 @@ def get_database_url() -> URL:
         port=settings.postgres_port,
         database=settings.postgres_db,
     )
+
 
 def run_migrations_offline() -> None:
     context.configure(
@@ -56,9 +55,9 @@ def do_run_migrations(connection) -> None:
 
 async def run_async_migrations() -> None:
     section = config.get_section(config.config_ini_section) or {}
-    section["sqlalchemy.url"] = get_database_url().render_as_string(
-        hide_password=False
-    ).replace("%", "%%")
+    section["sqlalchemy.url"] = (
+        get_database_url().render_as_string(hide_password=False).replace("%", "%%")
+    )
 
     connectable = async_engine_from_config(
         section,

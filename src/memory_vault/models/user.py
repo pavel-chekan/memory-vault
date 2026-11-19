@@ -1,6 +1,4 @@
-
 import uuid
-from typing import Optional
 
 from sqlalchemy import BigInteger, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
@@ -23,7 +21,7 @@ class User(TimestampMixin, Base):
         nullable=False,
     )
 
-    username: Mapped[Optional[str]] = mapped_column(
+    username: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
     )
@@ -33,12 +31,12 @@ class User(TimestampMixin, Base):
         nullable=False,
     )
 
-    last_name: Mapped[Optional[str]] = mapped_column(
+    last_name: Mapped[str | None] = mapped_column(
         String(128),
         nullable=True,
     )
 
-    language_code: Mapped[Optional[str]] = mapped_column(
+    language_code: Mapped[str | None] = mapped_column(
         String(16),
         nullable=True,
     )

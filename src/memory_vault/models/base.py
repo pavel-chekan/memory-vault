@@ -1,11 +1,8 @@
-
 from datetime import datetime
-from typing import Any
 
 from sqlalchemy import MetaData, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import DateTime
-
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
