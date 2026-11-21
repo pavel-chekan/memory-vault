@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     postgres_user: str = "memory_vault"
     postgres_password: SecretStr
 
+    telegram_bot_token: SecretStr
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -208,9 +208,5 @@ async def test_register_concurrently_creates_single_user(
         }
     finally:
         async with session_factory() as session:
-            await session.execute(
-                delete(User).where(
-                    User.telegram_user_id == telegram_user_id
-                )
-            )
+            await session.execute(delete(User).where(User.telegram_user_id == telegram_user_id))
             await session.commit()
