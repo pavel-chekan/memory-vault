@@ -6,8 +6,10 @@ from sqlalchemy.ext.asyncio import (
     AsyncSession,
 )
 
+from memory_vault.config import Settings
 
-def create_database_url(settings) -> URL:
+
+def create_database_url(settings: Settings) -> URL:
     return URL.create(
         drivername="postgresql+asyncpg",
         username=settings.postgres_user,

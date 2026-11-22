@@ -63,3 +63,8 @@ pythonpath = ["src"]
 python_version = "3.15"
 strict = true
 warn_unused_configs = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["asyncpg"]
+ignore_missing_imports = true

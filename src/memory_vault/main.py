@@ -1,6 +1,7 @@
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from typing import Annotated, AsyncIterator
+from typing import Annotated
 
 from aiogram import Bot
 from fastapi import Depends, FastAPI
@@ -75,14 +76,14 @@ app.include_router(users_router)
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/health/db")
 async def database_health(
     session: Annotated[AsyncSession, Depends(get_session)],
-):
+) -> dict[str, str | int]:
     result = await session.execute(text("SELECT 1"))
 
     return {
