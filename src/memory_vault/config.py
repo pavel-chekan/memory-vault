@@ -22,6 +22,14 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr
 
+    outbox_worker_enabled: bool = False
+    outbox_batch_size: int = 10
+    outbox_lease_duration_seconds: int = 60
+    outbox_heartbeat_interval_seconds: float | None = None
+    outbox_poll_interval: float = 1.0
+    outbox_handler_timeout_seconds: float | None = None
+    outbox_shutdown_timeout_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:

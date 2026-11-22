@@ -7,10 +7,11 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete, func, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from memory_vault.models.outbox_event import OutboxEvent, OutboxEventStatus
-from memory_vault.services.outbox import OutboxService
+from memory_vault.services.outbox import DEFAULT_MAX_ATTEMPTS, OutboxService
 from memory_vault.workers.outbox_worker import OutboxWorker
 
 SessionFactory = async_sessionmaker[AsyncSession]
@@ -69,6 +70,16 @@ class OutboxHarness:
             )
             await session.commit()
 
+    async def make_available(self, event_id: uuid.UUID) -> None:
+        """Skip the retry backoff so the next claim happens immediately."""
+        async with self.session_factory() as session:
+            await session.execute(
+                update(OutboxEvent)
+                .where(OutboxEvent.id == event_id)
+                .values(available_at=func.now())
+            )
+            await session.commit()
+
     async def cleanup(self) -> None:
         if not self.event_ids:
             return
@@ -99,14 +110,33 @@ def _worker(
     *,
     worker_id: str = "worker-a",
     heartbeat_interval_seconds: float = 0.05,
+    batch_size: int = 1,
+    handler_timeout_seconds: float | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    poll_interval: float = 1.0,
 ) -> OutboxWorker:
     return OutboxWorker(
         outbox.session_factory,
         handlers={"test.event": handler},
         worker_id=worker_id,
+        batch_size=batch_size,
         lease_duration_seconds=60,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
+        handler_timeout_seconds=handler_timeout_seconds,
+        max_attempts=max_attempts,
+        poll_interval=poll_interval,
     )
+
+
+OUTBOX_TASK_PREFIXES = ("outbox-event-", "outbox-heartbeat-", "outbox-handler-")
+
+
+def _outbox_task_names() -> list[str]:
+    return [
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith(OUTBOX_TASK_PREFIXES)
+    ]
 
 
 async def test_heartbeat_renews_lease_while_handler_runs(
@@ -207,6 +237,7 @@ async def test_no_renewal_when_handler_finishes_before_first_heartbeat(
 
 async def test_lease_loss_cancels_handler(
     outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     event = await outbox.create_event()
 
@@ -221,6 +252,22 @@ async def test_lease_loss_cancels_handler(
         except asyncio.CancelledError:
             handler_cancelled.set()
             raise
+
+    complete_calls = 0
+    original_complete = OutboxService.complete
+
+    async def counting_complete(
+        self: OutboxService,
+        *args: Any,
+        **kwargs: Any,
+    ) -> OutboxEvent | None:
+        nonlocal complete_calls
+
+        complete_calls += 1
+
+        return await original_complete(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxService, "complete", counting_complete)
 
     worker = _worker(outbox, handler)
     run_task = asyncio.create_task(worker.run_once())
@@ -239,6 +286,8 @@ async def test_lease_loss_cancels_handler(
     assert handler_cancelled.is_set()
 
     # Worker A must not complete or fail an event it no longer owns.
+    assert complete_calls == 0
+
     stored = await outbox.get(event.id)
 
     assert stored is not None
@@ -268,7 +317,11 @@ async def test_heartbeat_error_fails_event_and_cancels_handler(
             raise
 
     async def broken_renew(self: OutboxService, *args: Any, **kwargs: Any) -> bool:
-        raise RuntimeError("database unavailable")
+        raise OperationalError(
+            "UPDATE outbox_events SET lease_expires_at = now() + interval '60 seconds'",
+            {},
+            Exception("connection to server was lost"),
+        )
 
     monkeypatch.setattr(OutboxService, "renew_lease", broken_renew)
 
@@ -332,3 +385,526 @@ async def test_default_heartbeat_interval_is_one_third_of_lease(
     )
 
     assert worker.heartbeat_interval_seconds == 20.0
+
+
+async def test_handler_timeout_fails_event(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(_: OutboxEvent) -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    worker = _worker(outbox, handler, handler_timeout_seconds=0.1)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+    assert handler_cancelled.is_set()
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PENDING
+    assert stored.lease_token is None
+    assert stored.attempt_count == 1
+    assert stored.last_error is not None
+    assert "timed out" in stored.last_error.lower()
+
+
+async def test_handler_raised_timeout_error_is_not_reported_as_worker_timeout(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        raise TimeoutError("upstream connect timeout")
+
+    # No worker timeout is configured, so the handler's own TimeoutError must
+    # be reported verbatim instead of as the worker's handler timeout.
+    worker = _worker(outbox, handler, handler_timeout_seconds=None)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PENDING
+    assert stored.last_error == "upstream connect timeout"
+
+
+async def test_handler_timeout_error_is_distinguished_from_worker_timeout(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        # Fails long before the worker's timeout expires.
+        raise TimeoutError("upstream connect timeout")
+
+    worker = _worker(outbox, handler, handler_timeout_seconds=5)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PENDING
+    assert stored.last_error == "upstream connect timeout"
+    assert "timed out" not in stored.last_error.lower()
+
+
+async def test_stop_during_long_handler_is_graceful(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+    handler_started = asyncio.Event()
+
+    async def handler(_: OutboxEvent) -> None:
+        handler_started.set()
+        await asyncio.sleep(0.2)
+
+    worker = _worker(outbox, handler, poll_interval=0.05)
+    run_task = asyncio.create_task(worker.run())
+
+    await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+    worker.stop()
+    await asyncio.wait_for(run_task, timeout=5)
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSED
+    assert _outbox_task_names() == []
+
+
+async def test_external_cancel_cancels_handler_and_heartbeat(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(_: OutboxEvent) -> None:
+        handler_started.set()
+
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    worker = _worker(outbox, handler)
+    run_task = asyncio.create_task(worker.run())
+
+    await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+    run_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert handler_cancelled.is_set()
+    assert _outbox_task_names() == []
+
+    # A hard cancel does not write to the event; the lease expires instead.
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSING
+    assert stored.locked_by == "worker-a"
+    assert stored.lease_token is not None
+    assert stored.lease_expires_at is not None
+
+    # A hard cancel does not release the lease; it simply expires, after which
+    # another worker can reclaim the event.
+    await outbox.expire_lease(event.id)
+    reclaimed = await outbox.claim("worker-b")
+
+    assert len(reclaimed) == 1
+    assert reclaimed[0].id == event.id
+    assert reclaimed[0].attempt_count == 2
+
+
+async def test_no_orphan_tasks_after_run_once(
+    outbox: OutboxHarness,
+) -> None:
+    await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        await asyncio.sleep(0.1)
+
+    worker = _worker(outbox, handler)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+    assert _outbox_task_names() == []
+
+
+async def test_batch_is_processed_concurrently(
+    outbox: OutboxHarness,
+) -> None:
+    for _ in range(3):
+        await outbox.create_event()
+
+    running = 0
+    max_running = 0
+    started = 0
+    all_started = asyncio.Event()
+
+    async def handler(_: OutboxEvent) -> None:
+        nonlocal running, max_running, started
+
+        running += 1
+        started += 1
+        max_running = max(max_running, running)
+
+        if started == 3:
+            all_started.set()
+
+        try:
+            # Deadlocks (until the timeout) if the batch is processed sequentially.
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+        finally:
+            running -= 1
+
+    worker = _worker(outbox, handler, batch_size=3)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=10)
+
+    assert processed == 3
+    assert max_running == 3
+
+
+async def test_stop_interrupts_poll_sleep(
+    outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_events(self: OutboxWorker) -> list[OutboxEvent]:
+        return []
+
+    monkeypatch.setattr(OutboxWorker, "_claim_batch", no_events)
+
+    worker = OutboxWorker(
+        outbox.session_factory,
+        handlers={},
+        worker_id="worker-a",
+        lease_duration_seconds=60,
+        heartbeat_interval_seconds=0.05,
+        poll_interval=30.0,
+    )
+    run_task = asyncio.create_task(worker.run())
+
+    # Let the loop reach the poll wait before stopping it.
+    await asyncio.sleep(0.1)
+
+    worker.stop()
+    await asyncio.wait_for(run_task, timeout=2)
+
+
+async def test_claim_error_propagates_without_task_leak(
+    outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def broken_claim(self: OutboxService, *args: Any, **kwargs: Any) -> list[OutboxEvent]:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(OutboxService, "claim_batch", broken_claim)
+
+    async def handler(_: OutboxEvent) -> None:
+        return None
+
+    worker = _worker(outbox, handler)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await worker.run_once()
+
+    assert _outbox_task_names() == []
+
+
+async def test_complete_without_valid_lease_is_not_raised(
+    outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = await outbox.create_event()
+
+    async def lost_lease(self: OutboxService, *args: Any, **kwargs: Any) -> OutboxEvent | None:
+        return None
+
+    monkeypatch.setattr(OutboxService, "complete", lost_lease)
+
+    async def handler(_: OutboxEvent) -> None:
+        return None
+
+    worker = _worker(outbox, handler)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSING
+
+
+async def test_fail_without_valid_lease_is_not_raised(
+    outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = await outbox.create_event()
+
+    async def lost_lease(self: OutboxService, *args: Any, **kwargs: Any) -> OutboxEvent | None:
+        return None
+
+    monkeypatch.setattr(OutboxService, "handle_failure", lost_lease)
+
+    async def handler(_: OutboxEvent) -> None:
+        raise RuntimeError("handler boom")
+
+    worker = _worker(outbox, handler)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSING
+
+
+async def test_complete_database_error_does_not_crash_worker(
+    outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = await outbox.create_event()
+
+    async def broken_complete(self: OutboxService, *args: Any, **kwargs: Any) -> OutboxEvent | None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(OutboxService, "complete", broken_complete)
+
+    async def handler(_: OutboxEvent) -> None:
+        return None
+
+    worker = _worker(outbox, handler)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSING
+
+
+async def test_self_cancelled_handler_is_failed_not_completed(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        raise asyncio.CancelledError("handler self-cancelled")
+
+    worker = _worker(outbox, handler)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PENDING
+    assert stored.lease_token is None
+    assert stored.attempt_count == 1
+    assert stored.last_error is not None
+    assert "cancelled" in stored.last_error.lower()
+
+
+async def test_claim_works_with_expire_on_commit_factory(
+    outbox: OutboxHarness,
+    engine: AsyncEngine,
+) -> None:
+    session_factory = async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=True,
+    )
+    event = await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        return None
+
+    worker = OutboxWorker(
+        session_factory,
+        handlers={"test.event": handler},
+        worker_id="worker-a",
+        lease_duration_seconds=60,
+        heartbeat_interval_seconds=0.05,
+    )
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSED
+
+
+async def test_successful_processing_transitions_pending_to_processing_to_processed(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+    observed_statuses: list[OutboxEventStatus] = []
+    handler_started = asyncio.Event()
+    handler_release = asyncio.Event()
+
+    async def handler(_: OutboxEvent) -> None:
+        current = await outbox.get(event.id)
+
+        assert current is not None
+        observed_statuses.append(current.status)
+
+        handler_started.set()
+        await handler_release.wait()
+
+    worker = _worker(outbox, handler)
+    run_task = asyncio.create_task(worker.run_once())
+
+    await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+    in_flight = await outbox.get(event.id)
+
+    assert in_flight is not None
+    assert in_flight.status == OutboxEventStatus.PROCESSING
+
+    handler_release.set()
+    processed = await asyncio.wait_for(run_task, timeout=5)
+
+    assert processed == 1
+    assert observed_statuses == [OutboxEventStatus.PROCESSING]
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSED
+    assert stored.processed_at is not None
+    assert stored.locked_by is None
+    assert stored.lease_token is None
+    assert stored.lease_expires_at is None
+
+
+async def test_handler_error_returns_event_to_pending(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        raise RuntimeError("handler boom")
+
+    worker = _worker(outbox, handler)
+
+    processed = await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    assert processed == 1
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PENDING
+    assert stored.attempt_count == 1
+    assert stored.locked_by is None
+    assert stored.lease_token is None
+    assert stored.lease_expires_at is None
+    assert stored.last_error == "handler boom"
+
+
+async def test_event_becomes_failed_after_max_attempts(
+    outbox: OutboxHarness,
+) -> None:
+    event = await outbox.create_event()
+
+    async def handler(_: OutboxEvent) -> None:
+        raise RuntimeError("handler boom")
+
+    worker = _worker(outbox, handler, max_attempts=2)
+
+    # First failure: still retryable.
+    await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    first = await outbox.get(event.id)
+
+    assert first is not None
+    assert first.status == OutboxEventStatus.PENDING
+    assert first.attempt_count == 1
+
+    # Skip the retry backoff so the second attempt happens immediately.
+    await outbox.make_available(event.id)
+
+    # Second failure reaches max_attempts and is terminal.
+    await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.FAILED
+    assert stored.attempt_count == 2
+    assert stored.locked_by is None
+    assert stored.lease_token is None
+    assert stored.lease_expires_at is None
+    assert stored.last_error == "handler boom"
+
+
+async def test_graceful_shutdown_finishes_current_batch(
+    outbox: OutboxHarness,
+) -> None:
+    events = [await outbox.create_event() for _ in range(3)]
+    all_started = asyncio.Event()
+    started = 0
+    finished = 0
+
+    async def handler(_: OutboxEvent) -> None:
+        nonlocal started, finished
+
+        started += 1
+
+        if started == len(events):
+            all_started.set()
+
+        await asyncio.sleep(0.1)
+        finished += 1
+
+    worker = _worker(outbox, handler, batch_size=len(events), poll_interval=0.05)
+    run_task = asyncio.create_task(worker.run())
+
+    await asyncio.wait_for(all_started.wait(), timeout=5)
+
+    # The whole in-flight batch must drain before run() returns.
+    worker.stop()
+    await asyncio.wait_for(run_task, timeout=5)
+
+    assert finished == len(events)
+
+    for event in events:
+        stored = await outbox.get(event.id)
+
+        assert stored is not None
+        assert stored.status == OutboxEventStatus.PROCESSED
+        assert stored.locked_by is None
+        assert stored.lease_token is None
