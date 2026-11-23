@@ -133,6 +133,19 @@ class OutboxWorker:
         """
         self._stop_event.set()
 
+    @property
+    def stop_requested(self) -> bool:
+        """Return whether ``stop()`` has been called."""
+        return self._stop_event.is_set()
+
+    async def wait_for_stop(self) -> None:
+        """Wait until ``stop()`` is called.
+
+        The caller bounds the wait with ``asyncio.wait_for`` when a timeout is
+        needed.
+        """
+        await self._stop_event.wait()
+
     async def run(self) -> None:
         while not self._stop_event.is_set():
             processed = await self.run_once()

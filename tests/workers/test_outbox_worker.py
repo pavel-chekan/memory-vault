@@ -1165,3 +1165,60 @@ async def test_graceful_shutdown_finishes_current_batch(
         assert stored.status == OutboxEventStatus.PROCESSED
         assert stored.locked_by is None
         assert stored.lease_token is None
+
+
+async def _noop_handler(_: OutboxEvent) -> None:
+    return None
+
+
+async def test_stop_requested_is_false_until_stop(
+    outbox: OutboxHarness,
+) -> None:
+    worker = _worker(outbox, _noop_handler)
+
+    assert worker.stop_requested is False
+
+    worker.stop()
+
+    assert worker.stop_requested is True
+
+
+async def test_wait_for_stop_returns_immediately_when_stop_is_requested(
+    outbox: OutboxHarness,
+) -> None:
+    worker = _worker(outbox, _noop_handler)
+    worker.stop()
+
+    start = asyncio.get_running_loop().time()
+
+    await asyncio.wait_for(worker.wait_for_stop(), timeout=5)
+
+    assert asyncio.get_running_loop().time() - start < 0.5
+
+
+async def test_wait_for_stop_blocks_until_stop_is_requested(
+    outbox: OutboxHarness,
+) -> None:
+    worker = _worker(outbox, _noop_handler)
+    wait_task = asyncio.create_task(worker.wait_for_stop())
+
+    await asyncio.sleep(0)
+
+    assert not wait_task.done()
+
+    worker.stop()
+
+    await asyncio.wait_for(wait_task, timeout=5)
+
+
+async def test_wait_for_stop_times_out_when_stop_is_not_requested(
+    outbox: OutboxHarness,
+) -> None:
+    worker = _worker(outbox, _noop_handler)
+
+    start = asyncio.get_running_loop().time()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(worker.wait_for_stop(), timeout=0.05)
+
+    assert asyncio.get_running_loop().time() - start >= 0.05

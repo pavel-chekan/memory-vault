@@ -22,6 +22,12 @@ from memory_vault.workers.outbox_worker import OutboxWorker
 
 logger = logging.getLogger(__name__)
 
+# Backoff between outbox worker restarts. The first crash restarts after
+# ``_OUTBOX_RESTART_INITIAL_BACKOFF_SECONDS``; each later crash doubles the
+# delay up to ``_OUTBOX_RESTART_MAX_BACKOFF_SECONDS``.
+_OUTBOX_RESTART_INITIAL_BACKOFF_SECONDS = 1.0
+_OUTBOX_RESTART_MAX_BACKOFF_SECONDS = 60.0
+
 
 async def _wait_for_task(task: asyncio.Task[None], wait_timeout: float) -> bool:
     """Return whether ``task`` finished within ``wait_timeout``.
@@ -54,6 +60,14 @@ async def _stop_outbox_worker(
     task: asyncio.Task[None] | None,
     shutdown_timeout: float,
 ) -> None:
+    """Stop the outbox worker with two bounded phases.
+
+    Phase 1: request a graceful stop and wait up to ``shutdown_timeout`` for
+    the task to finish. Phase 2: if the task has not finished, cancel it and
+    wait up to ``shutdown_timeout`` more; if it still has not finished, log an
+    error and abandon it. The total worst case is therefore
+    ``2 * shutdown_timeout``.
+    """
     if worker is None or task is None:
         return
 
@@ -78,6 +92,49 @@ async def _stop_outbox_worker(
         "abandoning it (a handler is not cancellation-cooperative)",
         shutdown_timeout,
     )
+
+
+async def _supervise_outbox_worker(worker: OutboxWorker) -> None:
+    """Run the outbox worker, restarting it after an unexpected crash.
+
+    ``worker.run()`` returns only when it has been gracefully stopped. An
+    exception escaping from ``run()`` means the worker crashed (for example a
+    database failure while claiming a batch); it is logged and restarted with a
+    capped exponential backoff so background processing resumes instead of
+    silently dying. Graceful shutdown is always honoured: the supervisor stops
+    immediately when ``stop()`` is requested, whether it happens before, during,
+    or after a crash.
+    """
+    backoff = _OUTBOX_RESTART_INITIAL_BACKOFF_SECONDS
+
+    while not worker.stop_requested:
+        try:
+            await worker.run()
+        except asyncio.CancelledError:
+            # Shutdown may cancel the supervisor (or the worker itself).
+            # Re-raise so shutdown isn't blocked by a supervisor cleanup.
+            raise
+        except Exception:
+            if worker.stop_requested:
+                # ``stop()`` raced with the crash; do not restart.
+                logger.exception("Outbox worker raised after stop was requested")
+                return
+
+            logger.exception(
+                "Outbox worker crashed; restarting in %.1f seconds",
+                backoff,
+            )
+
+            try:
+                await asyncio.wait_for(worker.wait_for_stop(), timeout=backoff)
+            except TimeoutError:
+                backoff = min(backoff * 2, _OUTBOX_RESTART_MAX_BACKOFF_SECONDS)
+                continue
+
+            # stop() was requested during the backoff wait.
+            return
+
+        return
 
 
 @asynccontextmanager
@@ -131,7 +188,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         if outbox_worker is not None:
             outbox_task = asyncio.create_task(
-                outbox_worker.run(),
+                _supervise_outbox_worker(outbox_worker),
                 name="outbox-worker",
             )
 

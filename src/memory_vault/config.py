@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     outbox_heartbeat_interval_seconds: float | None = None
     outbox_poll_interval: float = 1.0
     outbox_handler_timeout_seconds: float | None = None
-    outbox_shutdown_timeout_seconds: float = 30.0
+    outbox_shutdown_timeout_seconds: float = Field(default=30.0, gt=0)
 
 
 @lru_cache
