@@ -334,6 +334,23 @@ async def test_lease_loss_cancels_handler(
 
     monkeypatch.setattr(OutboxService, "complete", counting_complete)
 
+    # Block the heartbeat in renew_lease until worker-b has taken over the
+    # event. This makes the renewal-observation of the lost ownership a fixed
+    # precondition of the test instead of a race with the reclaim.
+    reclaimed_by_worker_b = asyncio.Event()
+    original_renew = OutboxService.renew_lease
+
+    async def renew_after_reclaim(
+        self: OutboxService,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        await reclaimed_by_worker_b.wait()
+
+        return await original_renew(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxService, "renew_lease", renew_after_reclaim)
+
     worker = _worker(outbox, handler)
     run_task = asyncio.create_task(worker.run_once())
 
@@ -342,6 +359,10 @@ async def test_lease_loss_cancels_handler(
     # The lease expires and another worker reclaims the event with a fresh token.
     await outbox.expire_lease(event.id)
     reclaimed = await outbox.claim("worker-b")
+
+    # Release the blocked heartbeat; it must observe the lost ownership and
+    # cancel the handler.
+    reclaimed_by_worker_b.set()
 
     assert len(reclaimed) == 1
 
@@ -485,6 +506,15 @@ async def test_heartbeat_failure_with_database_unavailable_leaves_event_processi
     run_task = asyncio.create_task(worker.run_once())
 
     await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+    # The claim already committed before the handler started, and the broken
+    # renew writes nothing, so the lease is expected to be exactly as claimed.
+    original_lease = await outbox.get(event.id)
+
+    assert original_lease is not None
+    assert original_lease.lease_token is not None
+    assert original_lease.lease_expires_at is not None
+
     await asyncio.wait_for(renew_started.wait(), timeout=5)
 
     processed = await asyncio.wait_for(run_task, timeout=5)
@@ -500,8 +530,9 @@ async def test_heartbeat_failure_with_database_unavailable_leaves_event_processi
     assert stored is not None
     assert stored.status == OutboxEventStatus.PROCESSING
     assert stored.locked_by == "worker-a"
-    assert stored.lease_token is not None
-    assert stored.lease_expires_at is not None
+    assert stored.lease_token == original_lease.lease_token
+    assert stored.lease_expires_at == original_lease.lease_expires_at
+    assert stored.attempt_count == 1
     assert stored.last_error is None
 
     # The lease is not released by the failure: it simply expires, after which
@@ -702,12 +733,29 @@ async def test_external_cancel_cancels_handler_and_heartbeat(
 
     monkeypatch.setattr(OutboxService, "fail", counting_fail)
 
+    # Signal that the heartbeat task has reached its first iteration, so the
+    # cancel below is guaranteed to hit a live heartbeat, not a not-yet-started one.
+    heartbeat_started = asyncio.Event()
+    original_heartbeat = OutboxWorker._heartbeat
+
+    async def signaling_heartbeat(
+        self: OutboxWorker,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        heartbeat_started.set()
+
+        await original_heartbeat(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxWorker, "_heartbeat", signaling_heartbeat)
+
     # heartbeat_interval_seconds=30 (>= test duration) guarantees that no
     # legitimate renewal can change the lease, so any change is a bug.
     worker = _worker(outbox, handler, heartbeat_interval_seconds=30)
     run_task = asyncio.create_task(worker.run_once())
 
     await asyncio.wait_for(handler_started.wait(), timeout=5)
+    await asyncio.wait_for(heartbeat_started.wait(), timeout=5)
 
     lease_before = await outbox.get(event.id)
 
