@@ -128,6 +128,57 @@ def _worker(
     )
 
 
+def _database_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    renew_started: asyncio.Event | None = None,
+) -> dict[str, int]:
+    """Make every service-level write fail as an unreachable database would.
+
+    ``renew_lease`` is replaced with a shim that marks ``renew_started`` before
+    raising, so the caller can synchronize on the heartbeat attempt. ``complete``
+    and ``fail`` are replaced with call-through-counting shims that raise, so the
+    caller can also assert which writes the worker attempted.
+
+    Returns a mapping with the attempted ``complete``/``fail`` call counts.
+    """
+    calls = {"complete": 0, "fail": 0}
+
+    async def broken_renew(self: OutboxService, *args: Any, **kwargs: Any) -> bool:
+        if renew_started is not None:
+            renew_started.set()
+
+        raise OperationalError(
+            "UPDATE outbox_events SET lease_expires_at = now() + interval '60 seconds'",
+            {},
+            Exception("connection to server was lost"),
+        )
+
+    async def broken_complete(self: OutboxService, *args: Any, **kwargs: Any) -> Any:
+        calls["complete"] += 1
+
+        raise OperationalError(
+            "UPDATE outbox_events SET status = 'PROCESSED'",
+            {},
+            Exception("connection to server was lost"),
+        )
+
+    async def broken_fail(self: OutboxService, *args: Any, **kwargs: Any) -> Any:
+        calls["fail"] += 1
+
+        raise OperationalError(
+            "UPDATE outbox_events SET status = 'PENDING'",
+            {},
+            Exception("connection to server was lost"),
+        )
+
+    monkeypatch.setattr(OutboxService, "renew_lease", broken_renew)
+    monkeypatch.setattr(OutboxService, "complete", broken_complete)
+    monkeypatch.setattr(OutboxService, "fail", broken_fail)
+
+    return calls
+
+
 OUTBOX_TASK_PREFIXES = ("outbox-event-", "outbox-heartbeat-", "outbox-handler-")
 
 
@@ -141,20 +192,34 @@ def _outbox_task_names() -> list[str]:
 
 async def test_heartbeat_renews_lease_while_handler_runs(
     outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     event = await outbox.create_event()
     observed_expiries: list[datetime | None] = []
+    renewed = asyncio.Event()
+
+    original_renew = OutboxService.renew_lease
+
+    async def counting_renew(self: OutboxService, *args: Any, **kwargs: Any) -> bool:
+        result = await original_renew(self, *args, **kwargs)
+
+        if result:
+            renewed.set()
+
+        return result
+
+    monkeypatch.setattr(OutboxService, "renew_lease", counting_renew)
 
     async def handler(_: OutboxEvent) -> None:
         initial = await outbox.get(event.id)
         observed_expiries.append(initial.lease_expires_at if initial else None)
 
-        await asyncio.sleep(0.15)
+        # Deterministic sync: wait for a real renewal instead of sleeping
+        # a fixed duration that only happens to cover one heartbeat.
+        await asyncio.wait_for(renewed.wait(), timeout=5)
 
         current = await outbox.get(event.id)
         observed_expiries.append(current.lease_expires_at if current else None)
-
-        await asyncio.sleep(0.1)
 
     worker = _worker(outbox, handler)
 
@@ -306,6 +371,7 @@ async def test_heartbeat_error_fails_event_and_cancels_handler(
 
     handler_started = asyncio.Event()
     handler_cancelled = asyncio.Event()
+    renew_started = asyncio.Event()
 
     async def handler(_: OutboxEvent) -> None:
         handler_started.set()
@@ -317,6 +383,8 @@ async def test_heartbeat_error_fails_event_and_cancels_handler(
             raise
 
     async def broken_renew(self: OutboxService, *args: Any, **kwargs: Any) -> bool:
+        renew_started.set()
+
         raise OperationalError(
             "UPDATE outbox_events SET lease_expires_at = now() + interval '60 seconds'",
             {},
@@ -325,18 +393,58 @@ async def test_heartbeat_error_fails_event_and_cancels_handler(
 
     monkeypatch.setattr(OutboxService, "renew_lease", broken_renew)
 
-    worker = _worker(outbox, handler)
+    complete_calls = 0
+    original_complete = OutboxService.complete
+
+    async def counting_complete(
+        self: OutboxService,
+        *args: Any,
+        **kwargs: Any,
+    ) -> OutboxEvent | None:
+        nonlocal complete_calls
+
+        complete_calls += 1
+
+        return await original_complete(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxService, "complete", counting_complete)
+
+    fail_calls = 0
+    original_fail = OutboxService.fail
+
+    async def counting_fail(
+        self: OutboxService,
+        *args: Any,
+        **kwargs: Any,
+    ) -> OutboxEvent | None:
+        nonlocal fail_calls
+
+        fail_calls += 1
+
+        return await original_fail(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxService, "fail", counting_fail)
+
+    # max_attempts=3 keeps this test on the retryable fail() branch instead of
+    # the terminal mark_failed() branch.
+    worker = _worker(outbox, handler, max_attempts=3)
     run_task = asyncio.create_task(worker.run_once())
 
     await asyncio.wait_for(handler_started.wait(), timeout=5)
+    await asyncio.wait_for(renew_started.wait(), timeout=5)
 
     processed = await asyncio.wait_for(run_task, timeout=5)
 
     assert processed == 1
     assert handler_cancelled.is_set()
 
-    # A renewal error is reported to the main task, which releases the lease and
-    # schedules the event for a retry instead of silently continuing.
+    # A heartbeat failure cancels the handler and must reach the retry path:
+    # complete() is never called and fail() is called exactly once.
+    assert complete_calls == 0
+    assert fail_calls == 1
+
+    # A heartbeat failure cancels the handler. The worker then attempts to
+    # release the lease and schedule the event for a retry.
     stored = await outbox.get(event.id)
 
     assert stored is not None
@@ -347,6 +455,63 @@ async def test_heartbeat_error_fails_event_and_cancels_handler(
     assert stored.attempt_count == 1
     assert stored.last_error is not None
     assert "renew" in stored.last_error.lower()
+
+
+async def test_heartbeat_failure_with_database_unavailable_leaves_event_processing(
+    outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = await outbox.create_event()
+
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    renew_started = asyncio.Event()
+
+    async def handler(_: OutboxEvent) -> None:
+        handler_started.set()
+
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    calls = _database_unavailable(monkeypatch, renew_started=renew_started)
+
+    # max_attempts=3 keeps this test on the retryable fail() branch. The
+    # failure cannot be persisted because the database is unreachable, so the
+    # worker must swallow it and leave the event PROCESSING to expire.
+    worker = _worker(outbox, handler, max_attempts=3)
+    run_task = asyncio.create_task(worker.run_once())
+
+    await asyncio.wait_for(handler_started.wait(), timeout=5)
+    await asyncio.wait_for(renew_started.wait(), timeout=5)
+
+    processed = await asyncio.wait_for(run_task, timeout=5)
+
+    assert processed == 1
+    assert handler_cancelled.is_set()
+    assert calls["complete"] == 0
+    assert calls["fail"] == 1
+    assert _outbox_task_names() == []
+
+    stored = await outbox.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.PROCESSING
+    assert stored.locked_by == "worker-a"
+    assert stored.lease_token is not None
+    assert stored.lease_expires_at is not None
+    assert stored.last_error is None
+
+    # The lease is not released by the failure: it simply expires, after which
+    # another worker can reclaim the event.
+    await outbox.expire_lease(event.id)
+    reclaimed = await outbox.claim("worker-b")
+
+    assert len(reclaimed) == 1
+    assert reclaimed[0].id == event.id
+    assert reclaimed[0].attempt_count == 2
 
 
 @pytest.mark.parametrize("interval", [0.0, -1.0, 60.0])
@@ -490,6 +655,7 @@ async def test_stop_during_long_handler_is_graceful(
 
 async def test_external_cancel_cancels_handler_and_heartbeat(
     outbox: OutboxHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     event = await outbox.create_event()
     handler_started = asyncio.Event()
@@ -504,10 +670,48 @@ async def test_external_cancel_cancels_handler_and_heartbeat(
             handler_cancelled.set()
             raise
 
-    worker = _worker(outbox, handler)
-    run_task = asyncio.create_task(worker.run())
+    complete_calls = 0
+    original_complete = OutboxService.complete
+
+    async def counting_complete(
+        self: OutboxService,
+        *args: Any,
+        **kwargs: Any,
+    ) -> OutboxEvent | None:
+        nonlocal complete_calls
+
+        complete_calls += 1
+
+        return await original_complete(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxService, "complete", counting_complete)
+
+    fail_calls = 0
+    original_fail = OutboxService.fail
+
+    async def counting_fail(
+        self: OutboxService,
+        *args: Any,
+        **kwargs: Any,
+    ) -> OutboxEvent | None:
+        nonlocal fail_calls
+
+        fail_calls += 1
+
+        return await original_fail(self, *args, **kwargs)
+
+    monkeypatch.setattr(OutboxService, "fail", counting_fail)
+
+    # heartbeat_interval_seconds=30 (>= test duration) guarantees that no
+    # legitimate renewal can change the lease, so any change is a bug.
+    worker = _worker(outbox, handler, heartbeat_interval_seconds=30)
+    run_task = asyncio.create_task(worker.run_once())
 
     await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+    lease_before = await outbox.get(event.id)
+
+    assert lease_before is not None
 
     run_task.cancel()
 
@@ -517,14 +721,19 @@ async def test_external_cancel_cancels_handler_and_heartbeat(
     assert handler_cancelled.is_set()
     assert _outbox_task_names() == []
 
-    # A hard cancel does not write to the event; the lease expires instead.
+    # A hard cancel propagates out of run_once: it is not turned into a
+    # failure write, so complete()/fail() must never be called.
+    assert complete_calls == 0
+    assert fail_calls == 0
+
+    # The lease is neither released nor renewed: it is left untouched to expire.
     stored = await outbox.get(event.id)
 
     assert stored is not None
     assert stored.status == OutboxEventStatus.PROCESSING
-    assert stored.locked_by == "worker-a"
-    assert stored.lease_token is not None
-    assert stored.lease_expires_at is not None
+    assert stored.locked_by == lease_before.locked_by == "worker-a"
+    assert stored.lease_token == lease_before.lease_token
+    assert stored.lease_expires_at == lease_before.lease_expires_at
 
     # A hard cancel does not release the lease; it simply expires, after which
     # another worker can reclaim the event.
