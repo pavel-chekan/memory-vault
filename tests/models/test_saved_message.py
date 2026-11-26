@@ -232,20 +232,19 @@ async def test_concurrent_duplicate_update_inserts_single_row(
         assert len(failures) == 1
         assert isinstance(failures[0], IntegrityError)
 
-        assert await _count_messages(
-            session_factory,
-            telegram_update_id=telegram_update_id,
-        ) == 1
+        assert (
+            await _count_messages(
+                session_factory,
+                telegram_update_id=telegram_update_id,
+            )
+            == 1
+        )
     finally:
         async with session_factory() as session:
             await session.execute(
-                delete(SavedMessage).where(
-                    SavedMessage.telegram_update_id == telegram_update_id
-                )
+                delete(SavedMessage).where(SavedMessage.telegram_update_id == telegram_update_id)
             )
-            await session.execute(
-                delete(User).where(User.telegram_user_id == telegram_user_id)
-            )
+            await session.execute(delete(User).where(User.telegram_user_id == telegram_user_id))
             await session.commit()
 
 
