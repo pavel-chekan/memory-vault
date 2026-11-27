@@ -66,6 +66,28 @@ class HandlerHarness:
 
         return event
 
+    async def create_raw_event(
+        self,
+        *,
+        aggregate_id: uuid.UUID,
+        payload: Any,
+    ) -> OutboxEvent:
+        # The outbox service requires a dict payload, so malformed non-object
+        # payloads are inserted via the model directly.
+        async with self.session_factory() as session:
+            event = OutboxEvent(
+                event_type=MESSAGE_RECEIVED_EVENT_TYPE,
+                aggregate_type=SAVED_MESSAGE_AGGREGATE_TYPE,
+                aggregate_id=aggregate_id,
+                payload=payload,
+            )
+            session.add(event)
+            await session.commit()
+
+        self.event_ids.append(event.id)
+
+        return event
+
     async def save_message(self, *, text: str) -> SavedMessage:
         telegram_id = _unique_telegram_id()
         data = TelegramMessageCreate(
@@ -185,10 +207,16 @@ async def test_worker_processes_saved_message_and_logs_text(
     assert stored.processed_at is not None
     assert stored.last_error is None
 
-    records = [record for record in caplog.records if record.name == HANDLER_LOGGER]
+    # Scope the assertion to this message's own log records: a batch_size=10
+    # worker may claim unrelated due events, so the total record count is not
+    # a stable assertion.
+    records = [
+        record
+        for record in caplog.records
+        if record.name == HANDLER_LOGGER and str(message.id) in record.getMessage()
+    ]
 
     assert len(records) == 1
-    assert str(message.id) in records[0].getMessage()
     assert f"text={'remember the milk'!r}" in records[0].getMessage()
 
 
@@ -266,6 +294,34 @@ async def test_malformed_payload_fails_event(
     assert stored.status == OutboxEventStatus.FAILED
     assert stored.last_error is not None
     assert "saved_message_id" in stored.last_error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(["not-a-dict"], id="list-payload"),
+        pytest.param("not-a-dict", id="string-payload"),
+    ],
+)
+async def test_non_object_payload_fails_event(
+    handlers: HandlerHarness,
+    payload: Any,
+) -> None:
+    event = await handlers.create_raw_event(
+        aggregate_id=uuid.uuid4(),
+        payload=payload,
+    )
+
+    worker = _worker(handlers, create_outbox_handlers(handlers.session_factory))
+
+    await asyncio.wait_for(worker.run_once(), timeout=5)
+
+    stored = await handlers.get(event.id)
+
+    assert stored is not None
+    assert stored.status == OutboxEventStatus.FAILED
+    assert stored.last_error is not None
+    assert "non-object payload" in stored.last_error
 
 
 async def test_payload_and_aggregate_mismatch_fails_event(
