@@ -1,15 +1,19 @@
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from memory_vault.services.saved_messages import MESSAGE_RECEIVED_EVENT_TYPE
+from memory_vault.workers.message_received import create_message_received_handler
 from memory_vault.workers.outbox_worker import OutboxEventHandler
 
 
-def create_outbox_handlers() -> dict[str, OutboxEventHandler]:
+def create_outbox_handlers(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> dict[str, OutboxEventHandler]:
     """Return the ``event_type`` -> handler registry for the outbox worker.
-
-    Handlers are registered here as event types are introduced. The registry is
-    empty until the first real handler exists, which is why the worker is
-    disabled by default (``OUTBOX_WORKER_ENABLED=false``).
 
     Every registered handler must follow the ``OutboxEventHandler`` contract:
     be idempotent, propagate ``asyncio.CancelledError``, and avoid blocking the
     event loop (a blocked loop also blocks the lease heartbeat).
     """
-    return {}
+    return {
+        MESSAGE_RECEIVED_EVENT_TYPE: create_message_received_handler(session_factory),
+    }

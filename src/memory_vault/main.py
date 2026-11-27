@@ -167,7 +167,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.outbox_worker_enabled:
             outbox_worker = OutboxWorker(
                 session_factory,
-                handlers=create_outbox_handlers(),
+                handlers=create_outbox_handlers(session_factory),
                 batch_size=settings.outbox_batch_size,
                 lease_duration_seconds=settings.outbox_lease_duration_seconds,
                 heartbeat_interval_seconds=settings.outbox_heartbeat_interval_seconds,

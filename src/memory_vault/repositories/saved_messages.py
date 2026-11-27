@@ -11,6 +11,10 @@ class SavedMessageRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def get_by_id(self, message_id: uuid.UUID) -> SavedMessage | None:
+        """Return the stored message, or ``None`` when it no longer exists."""
+        return await self.session.get(SavedMessage, message_id)
+
     async def create_if_absent(
         self,
         *,
